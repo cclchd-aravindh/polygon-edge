@@ -13,6 +13,8 @@ import (
 
 	"github.com/0xPolygon/polygon-edge/command"
 	"github.com/0xPolygon/polygon-edge/consensus/polybft"
+	"github.com/0xPolygon/polygon-edge/consensus/polybft/bitmap"
+	"github.com/0xPolygon/polygon-edge/consensus/polybft/validator"
 	"github.com/0xPolygon/polygon-edge/consensus/polybft/wallet"
 	"github.com/0xPolygon/polygon-edge/secrets"
 	"github.com/0xPolygon/polygon-edge/secrets/helper"
@@ -121,21 +123,43 @@ func parseTrackerStartBlocks(trackerStartBlocksRaw []string) (map[types.Address]
 }
 
 // parseBurnContractInfo parses provided burn contract information and returns burn contract block and address
-func parseBurnContractInfo(burnContractInfoRaw string) (uint64, types.Address, error) {
-	// <block>:<address>
+func parseBurnContractInfo(burnContractInfoRaw string) (*polybft.BurnContractInfo, error) {
+	// <block>:<address>[:<burn destination address>]
 	burnContractParts := strings.Split(burnContractInfoRaw, ":")
-	if len(burnContractParts) != 2 {
-		return 0, types.ZeroAddress, fmt.Errorf("expected format: <block>:<address>")
+	if len(burnContractParts) < 2 || len(burnContractParts) > 3 {
+		return nil, fmt.Errorf("expected format: <block>:<address>[:<burn destination>]")
 	}
 
 	blockRaw := burnContractParts[0]
 
-	block, err := types.ParseUint256orHex(&blockRaw)
+	blockNum, err := types.ParseUint64orHex(&blockRaw)
 	if err != nil {
-		return 0, types.ZeroAddress, fmt.Errorf("failed to parse amount %s: %w", blockRaw, err)
+		return nil, fmt.Errorf("failed to parse block number %s: %w", blockRaw, err)
 	}
 
-	return block.Uint64(), types.StringToAddress(burnContractParts[1]), nil
+	contractAddress := burnContractParts[1]
+	if err = types.IsValidAddress(contractAddress); err != nil {
+		return nil, fmt.Errorf("failed to parse contract address %s: %w", contractAddress, err)
+	}
+
+	if len(burnContractParts) == 2 {
+		return &polybft.BurnContractInfo{
+			BlockNumber:        blockNum,
+			Address:            types.StringToAddress(contractAddress),
+			DestinationAddress: types.ZeroAddress,
+		}, nil
+	}
+
+	destinationAddress := burnContractParts[2]
+	if err = types.IsValidAddress(destinationAddress); err != nil {
+		return nil, fmt.Errorf("failed to parse burn destination address %s: %w", destinationAddress, err)
+	}
+
+	return &polybft.BurnContractInfo{
+		BlockNumber:        blockNum,
+		Address:            types.StringToAddress(contractAddress),
+		DestinationAddress: types.StringToAddress(destinationAddress),
+	}, nil
 }
 
 // GetValidatorKeyFiles returns file names which has validator secrets
@@ -176,13 +200,13 @@ func GetValidatorKeyFiles(rootDir, filePrefix string) ([]string, error) {
 }
 
 // ReadValidatorsByPrefix reads validators secrets on a given root directory and with given folder prefix
-func ReadValidatorsByPrefix(dir, prefix string) ([]*polybft.Validator, error) {
+func ReadValidatorsByPrefix(dir, prefix string) ([]*validator.GenesisValidator, error) {
 	validatorKeyFiles, err := GetValidatorKeyFiles(dir, prefix)
 	if err != nil {
 		return nil, err
 	}
 
-	validators := make([]*polybft.Validator, len(validatorKeyFiles))
+	validators := make([]*validator.GenesisValidator, len(validatorKeyFiles))
 
 	for i, file := range validatorKeyFiles {
 		path := filepath.Join(dir, file)
@@ -192,7 +216,7 @@ func ReadValidatorsByPrefix(dir, prefix string) ([]*polybft.Validator, error) {
 			return nil, err
 		}
 
-		validators[i] = &polybft.Validator{
+		validators[i] = &validator.GenesisValidator{
 			Address:       types.Address(account.Ecdsa.Address()),
 			BlsPrivateKey: account.Bls,
 			BlsKey:        hex.EncodeToString(account.Bls.PublicKey().Marshal()),
@@ -227,4 +251,16 @@ func getSecrets(directory string) (*wallet.Account, string, error) {
 	}
 
 	return account, nodeID, err
+}
+
+// GenerateExtraDataPolyBft populates Extra with specific fields required for polybft consensus protocol
+func GenerateExtraDataPolyBft(validators []*validator.ValidatorMetadata) ([]byte, error) {
+	delta := &validator.ValidatorSetDelta{
+		Added:   validators,
+		Removed: bitmap.Bitmap{},
+	}
+
+	extra := polybft.Extra{Validators: delta, Checkpoint: &polybft.CheckpointData{}}
+
+	return extra.MarshalRLPTo(nil), nil
 }

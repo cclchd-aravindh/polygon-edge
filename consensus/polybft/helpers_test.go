@@ -12,6 +12,7 @@ import (
 	"github.com/0xPolygon/polygon-edge/consensus/polybft/bitmap"
 	"github.com/0xPolygon/polygon-edge/consensus/polybft/contractsapi"
 	bls "github.com/0xPolygon/polygon-edge/consensus/polybft/signer"
+	"github.com/0xPolygon/polygon-edge/consensus/polybft/validator"
 	"github.com/0xPolygon/polygon-edge/consensus/polybft/wallet"
 	"github.com/0xPolygon/polygon-edge/types"
 	"github.com/hashicorp/go-hclog"
@@ -79,11 +80,11 @@ func createTestCommitEpochInput(t *testing.T, epochID uint64,
 }
 
 func createTestDistributeRewardsInput(t *testing.T, epochID uint64,
-	validatorSet AccountSet, epochSize uint64) *contractsapi.DistributeRewardForRewardPoolFn {
+	validatorSet validator.AccountSet, epochSize uint64) *contractsapi.DistributeRewardForRewardPoolFn {
 	t.Helper()
 
 	if validatorSet == nil {
-		validatorSet = newTestValidators(t, 5).getPublicIdentities()
+		validatorSet = validator.NewTestValidators(t, 5).GetPublicIdentities()
 	}
 
 	uptime := make([]*contractsapi.Uptime, len(validatorSet))
@@ -142,84 +143,54 @@ func getEpochNumber(t *testing.T, blockNumber, epochSize uint64) uint64 {
 }
 
 // newTestState creates new instance of state used by tests.
-func newTestState(t *testing.T) *State {
-	t.Helper()
+func newTestState(tb testing.TB) *State {
+	tb.Helper()
 
 	dir := fmt.Sprintf("/tmp/consensus-temp_%v", time.Now().UTC().Format(time.RFC3339Nano))
 	err := os.Mkdir(dir, 0775)
 
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 
 	state, err := newState(path.Join(dir, "my.db"), hclog.NewNullLogger(), make(chan struct{}))
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 
-	t.Cleanup(func() {
+	tb.Cleanup(func() {
 		if err := os.RemoveAll(dir); err != nil {
-			t.Fatal(err)
+			tb.Fatal(err)
 		}
 	})
 
 	return state
 }
 
-func generateTestAccount(t *testing.T) *wallet.Account {
-	t.Helper()
+func generateTestAccount(tb testing.TB) *wallet.Account {
+	tb.Helper()
 
 	acc, err := wallet.GenerateAccount()
-	require.NoError(t, err)
+	require.NoError(tb, err)
 
 	return acc
 }
 
-// createValidatorSetDelta calculates ValidatorSetDelta based on the provided old and new validator sets
-func createValidatorSetDelta(oldValidatorSet, newValidatorSet AccountSet) (*ValidatorSetDelta, error) {
-	var addedValidators, updatedValidators AccountSet
-
-	oldValidatorSetMap := make(map[types.Address]*ValidatorMetadata)
-	removedValidators := map[types.Address]int{}
-
-	for i, validator := range oldValidatorSet {
-		if (validator.Address != types.Address{}) {
-			removedValidators[validator.Address] = i
-			oldValidatorSetMap[validator.Address] = validator
-		}
+// createTestBridgeConfig creates test bridge configuration with hard-coded addresses
+func createTestBridgeConfig() *BridgeConfig {
+	return &BridgeConfig{
+		StateSenderAddr:                   types.StringToAddress("1"),
+		CheckpointManagerAddr:             types.StringToAddress("2"),
+		ExitHelperAddr:                    types.StringToAddress("3"),
+		RootERC20PredicateAddr:            types.StringToAddress("4"),
+		ChildMintableERC20PredicateAddr:   types.StringToAddress("5"),
+		RootNativeERC20Addr:               types.StringToAddress("6"),
+		RootERC721PredicateAddr:           types.StringToAddress("8"),
+		ChildMintableERC721PredicateAddr:  types.StringToAddress("9"),
+		RootERC1155PredicateAddr:          types.StringToAddress("11"),
+		ChildMintableERC1155PredicateAddr: types.StringToAddress("12"),
+		CustomSupernetManagerAddr:         types.StringToAddress("13"),
+		StakeManagerAddr:                  types.StringToAddress("14"),
+		JSONRPCEndpoint:                   "http://localhost:8545",
 	}
-
-	for _, newValidator := range newValidatorSet {
-		// Check if the validator is among both old and new validator set
-		oldValidator, validatorExists := oldValidatorSetMap[newValidator.Address]
-		if validatorExists {
-			if !oldValidator.EqualAddressAndBlsKey(newValidator) {
-				return nil, fmt.Errorf("validator '%s' found in both old and new validator set, but its BLS keys differ",
-					newValidator.Address.String())
-			}
-
-			// If it is, then discard it from removed validators...
-			delete(removedValidators, newValidator.Address)
-
-			if !oldValidator.Equals(newValidator) {
-				updatedValidators = append(updatedValidators, newValidator)
-			}
-		} else {
-			// ...otherwise it is added
-			addedValidators = append(addedValidators, newValidator)
-		}
-	}
-
-	removedValsBitmap := bitmap.Bitmap{}
-	for _, i := range removedValidators {
-		removedValsBitmap.Set(uint64(i))
-	}
-
-	delta := &ValidatorSetDelta{
-		Added:   addedValidators,
-		Updated: updatedValidators,
-		Removed: removedValsBitmap,
-	}
-
-	return delta, nil
 }

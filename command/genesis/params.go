@@ -36,7 +36,6 @@ const (
 	posFlag               = "pos"
 	minValidatorCount     = "min-validator-count"
 	maxValidatorCount     = "max-validator-count"
-	mintableTokenFlag     = "mintable-native-token"
 	nativeTokenConfigFlag = "native-token-config"
 	rewardTokenCodeFlag   = "reward-token-code"
 	rewardWalletFlag      = "reward-wallet"
@@ -44,7 +43,7 @@ const (
 	defaultNativeTokenName     = "Polygon"
 	defaultNativeTokenSymbol   = "MATIC"
 	defaultNativeTokenDecimals = uint8(18)
-	nativeTokenParamsNumber    = 3
+	minNativeTokenParamsNumber = 4
 )
 
 // Legacy flags that need to be preserved for running clients
@@ -60,8 +59,8 @@ var (
 	errValidatorsNotSpecified = errors.New("validator information not specified")
 	errUnsupportedConsensus   = errors.New("specified consensusRaw not supported")
 	errInvalidEpochSize       = errors.New("epoch size must be greater than 1")
-	errInvalidTokenParams     = errors.New("native token params were not submitted in proper" +
-		" format <name:symbol:decimals count>")
+	errInvalidTokenParams     = errors.New("native token params were not submitted in proper format " +
+		"(<name:symbol:decimals count:mintable flag:[mintable token owner address]>)")
 	errRewardWalletAmountZero = errors.New("reward wallet amount can not be zero or negative")
 )
 
@@ -82,7 +81,7 @@ type genesisParams struct {
 	blockGasLimit uint64
 	isPos         bool
 
-	burnContracts []string
+	burnContract string
 
 	minNumValidators uint64
 	maxNumValidators uint64
@@ -100,11 +99,11 @@ type genesisParams struct {
 	// PolyBFT
 	validatorsPath       string
 	validatorsPrefixPath string
-	stakes               []string
 	validators           []string
 	sprintSize           uint64
 	blockTime            time.Duration
 	epochReward          uint64
+	blockTimeDrift       uint64
 
 	initialStateRoot string
 
@@ -122,7 +121,6 @@ type genesisParams struct {
 	bridgeBlockListAdmin             []string
 	bridgeBlockListEnabled           []string
 
-	mintableNativeToken  bool
 	nativeTokenConfigRaw string
 	nativeTokenConfig    *polybft.TokenConfig
 
@@ -146,6 +144,10 @@ func (p *genesisParams) validateFlags() error {
 
 	if p.isPolyBFTConsensus() {
 		if err := p.extractNativeTokenMetadata(); err != nil {
+			return err
+		}
+
+		if err := p.validateBurnContract(); err != nil {
 			return err
 		}
 
@@ -370,8 +372,8 @@ func (p *genesisParams) generateGenesis() error {
 func (p *genesisParams) initGenesisConfig() error {
 	// Disable london hardfork if burn contract address is not provided
 	enabledForks := chain.AllForksEnabled
-	if len(p.burnContracts) == 0 {
-		enabledForks.London = nil
+	if !p.isBurnContractEnabled() {
+		enabledForks.RemoveFork(chain.London)
 	}
 
 	chainConfig := &chain.Chain{
@@ -391,19 +393,19 @@ func (p *genesisParams) initGenesisConfig() error {
 		Bootnodes: p.bootnodes,
 	}
 
-	if len(p.burnContracts) > 0 {
+	// burn contract can be set only for non mintable native token
+	if p.isBurnContractEnabled() {
 		chainConfig.Genesis.BaseFee = command.DefaultGenesisBaseFee
 		chainConfig.Genesis.BaseFeeEM = command.DefaultGenesisBaseFeeEM
-		chainConfig.Params.BurnContract = make(map[uint64]string, len(p.burnContracts))
+		chainConfig.Params.BurnContract = make(map[uint64]types.Address, 1)
 
-		for _, burnContract := range p.burnContracts {
-			block, address, err := parseBurnContractInfo(burnContract)
-			if err != nil {
-				return err
-			}
-
-			chainConfig.Params.BurnContract[block] = address.String()
+		burnContractInfo, err := parseBurnContractInfo(p.burnContract)
+		if err != nil {
+			return err
 		}
+
+		chainConfig.Params.BurnContract[burnContractInfo.BlockNumber] = burnContractInfo.Address
+		chainConfig.Params.BurnContractDestinationAddress = burnContractInfo.DestinationAddress
 	}
 
 	// Predeploy staking smart contract if needed
@@ -474,45 +476,96 @@ func (p *genesisParams) validateRewardWallet() error {
 	return nil
 }
 
+// validateBurnContract validates burn contract. If native token is mintable,
+// burn contract flag must not be set. If native token is non mintable only one burn contract
+// can be set and the specified address will be used to predeploy default EIP1559 burn contract.
+func (p *genesisParams) validateBurnContract() error {
+	if p.isBurnContractEnabled() {
+		burnContractInfo, err := parseBurnContractInfo(p.burnContract)
+		if err != nil {
+			return fmt.Errorf("invalid burn contract info provided: %w", err)
+		}
+
+		if p.nativeTokenConfig.IsMintable {
+			if burnContractInfo.Address != types.ZeroAddress {
+				return errors.New("only zero address is allowed as burn destination for mintable native token")
+			}
+		} else {
+			if burnContractInfo.Address == types.ZeroAddress {
+				return errors.New("it is not allowed to deploy burn contract to 0x0 address")
+			}
+		}
+	}
+
+	return nil
+}
+
+// isBurnContractEnabled returns true in case burn contract info is provided
+func (p *genesisParams) isBurnContractEnabled() bool {
+	return p.burnContract != ""
+}
+
 // extractNativeTokenMetadata parses provided native token metadata (such as name, symbol and decimals count)
 func (p *genesisParams) extractNativeTokenMetadata() error {
 	if p.nativeTokenConfigRaw == "" {
 		p.nativeTokenConfig = &polybft.TokenConfig{
-			Name:     defaultNativeTokenName,
-			Symbol:   defaultNativeTokenSymbol,
-			Decimals: defaultNativeTokenDecimals,
+			Name:       defaultNativeTokenName,
+			Symbol:     defaultNativeTokenSymbol,
+			Decimals:   defaultNativeTokenDecimals,
+			IsMintable: false,
+			Owner:      types.ZeroAddress,
 		}
 
 		return nil
 	}
 
 	params := strings.Split(p.nativeTokenConfigRaw, ":")
-	if len(params) != nativeTokenParamsNumber { // 3 parameters
+	if len(params) < minNativeTokenParamsNumber {
 		return errInvalidTokenParams
 	}
 
-	p.nativeTokenConfig = &polybft.TokenConfig{
-		Name:     defaultNativeTokenName,
-		Symbol:   defaultNativeTokenSymbol,
-		Decimals: defaultNativeTokenDecimals,
-	}
-
-	p.nativeTokenConfig.Name = strings.TrimSpace(params[0])
-	if p.nativeTokenConfig.Name == "" {
+	// name
+	name := strings.TrimSpace(params[0])
+	if name == "" {
 		return errInvalidTokenParams
 	}
 
-	p.nativeTokenConfig.Symbol = strings.TrimSpace(params[1])
-	if p.nativeTokenConfig.Symbol == "" {
+	// symbol
+	symbol := strings.TrimSpace(params[1])
+	if symbol == "" {
 		return errInvalidTokenParams
 	}
 
+	// decimals
 	decimals, err := strconv.ParseUint(strings.TrimSpace(params[2]), 10, 8)
 	if err != nil || decimals > math.MaxUint8 {
 		return errInvalidTokenParams
 	}
 
-	p.nativeTokenConfig.Decimals = uint8(decimals)
+	// is mintable native token used
+	isMintable, err := strconv.ParseBool(strings.TrimSpace(params[3]))
+	if err != nil {
+		return errInvalidTokenParams
+	}
+
+	// in case it is mintable native token, it is expected to have 5 parameters provided
+	if isMintable && len(params) != minNativeTokenParamsNumber+1 {
+		return errInvalidTokenParams
+	}
+
+	// owner address
+	owner := types.ZeroAddress
+	if isMintable {
+		owner = types.StringToAddress(strings.TrimSpace(params[4]))
+	}
+
+	p.nativeTokenConfig = &polybft.TokenConfig{
+		Name:       name,
+		Symbol:     symbol,
+		Decimals:   uint8(decimals),
+		IsMintable: isMintable,
+		Owner:      owner,
+	}
 
 	return nil
 }

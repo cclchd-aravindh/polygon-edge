@@ -1,4 +1,4 @@
-package polybft
+package validator
 
 import (
 	"math/big"
@@ -19,8 +19,11 @@ type ValidatorSet interface {
 	// Accounts returns the list of the ValidatorMetadata
 	Accounts() AccountSet
 
-	// checks if submitted signers have reached quorum
+	// HasQuorum checks if submitted signers have reached quorum
 	HasQuorum(signers map[types.Address]struct{}) bool
+
+	// GetVotingPowers retrieves map: string(address) -> vp
+	GetVotingPowers() map[string]*big.Int
 }
 
 type validatorSet struct {
@@ -80,6 +83,16 @@ func (vs validatorSet) HasQuorum(signers map[types.Address]struct{}) bool {
 	return hasQuorum
 }
 
+func (vs validatorSet) GetVotingPowers() map[string]*big.Int {
+	result := make(map[string]*big.Int, vs.Len())
+
+	for address, vp := range vs.votingPowerMap {
+		result[types.AddressToString(address)] = vp
+	}
+
+	return result
+}
+
 func (vs validatorSet) Accounts() AccountSet {
 	return vs.validators
 }
@@ -90,6 +103,10 @@ func (vs validatorSet) Includes(address types.Address) bool {
 
 func (vs validatorSet) Len() int {
 	return vs.validators.Len()
+}
+
+func (vs validatorSet) TotalVotingPower() big.Int {
+	return *vs.totalVotingPower
 }
 
 // getQuorumSize calculates quorum size as 2/3 super-majority of provided total voting power

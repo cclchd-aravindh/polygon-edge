@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/0xPolygon/polygon-edge/command"
+	"github.com/0xPolygon/polygon-edge/command/bridge/common"
 	"github.com/0xPolygon/polygon-edge/command/helper"
 	"github.com/0xPolygon/polygon-edge/command/polybftsecrets"
 	sidechainHelper "github.com/0xPolygon/polygon-edge/command/sidechain"
@@ -77,10 +78,9 @@ func runCommand(cmd *cobra.Command, _ []string) error {
 	}
 
 	txn := &ethgo.Transaction{
-		From:     validatorAccount.Ecdsa.Address(),
-		Input:    encoded,
-		To:       (*ethgo.Address)(&contracts.ValidatorSetContract),
-		GasPrice: sidechainHelper.DefaultGasPrice,
+		From:  validatorAccount.Ecdsa.Address(),
+		Input: encoded,
+		To:    (*ethgo.Address)(&contracts.ValidatorSetContract),
 	}
 
 	receipt, err := txRelayer.SendTransaction(txn, validatorAccount.Ecdsa)
@@ -90,10 +90,6 @@ func runCommand(cmd *cobra.Command, _ []string) error {
 
 	if receipt.Status != uint64(types.ReceiptSuccess) {
 		return fmt.Errorf("withdraw transaction failed on block: %d", receipt.BlockNumber)
-	}
-
-	result := &withdrawResult{
-		validatorAddress: validatorAccount.Ecdsa.Address().String(),
 	}
 
 	var (
@@ -110,7 +106,6 @@ func runCommand(cmd *cobra.Command, _ []string) error {
 
 		if doesMatch {
 			foundLog = true
-			result.amount = withdrawalEvent.Amount.Uint64()
 
 			break
 		}
@@ -120,7 +115,18 @@ func runCommand(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("could not find an appropriate log in receipt that withdraw happened on ValidatorSet")
 	}
 
-	outputter.WriteCommandResult(result)
+	exitEventID, err := common.ExtractExitEventID(receipt)
+	if err != nil {
+		return fmt.Errorf("withdrawal failed: %w", err)
+	}
+
+	outputter.WriteCommandResult(
+		&withdrawResult{
+			validatorAddress: validatorAccount.Ecdsa.Address().String(),
+			amount:           withdrawalEvent.Amount,
+			exitEventID:      exitEventID,
+			blockNumber:      receipt.BlockNumber,
+		})
 
 	return nil
 }

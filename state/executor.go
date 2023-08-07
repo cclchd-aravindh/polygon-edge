@@ -28,8 +28,6 @@ const (
 	TxGasContractCreation uint64 = 53000 // Per transaction that creates a contract
 )
 
-var emptyCodeHashTwo = types.BytesToHash(crypto.Keccak256(nil))
-
 // GetHashByNumber returns the hash function of a block number
 type GetHashByNumber = func(i uint64) types.Hash
 
@@ -114,7 +112,11 @@ func (e *Executor) WriteGenesis(
 		}
 	}
 
-	objs := txn.Commit(false)
+	objs, err := txn.Commit(false)
+	if err != nil {
+		return types.Hash{}, err
+	}
+
 	_, root := snap.Commit(objs)
 
 	return types.BytesToHash(root), nil
@@ -365,7 +367,9 @@ func (t *Transition) Write(txn *types.Transaction) error {
 	}
 
 	// The suicided accounts are set as deleted for the next iteration
-	t.state.CleanDeleteObjects(true)
+	if err := t.state.CleanDeleteObjects(true); err != nil {
+		return fmt.Errorf("failed to clean deleted objects: %w", err)
+	}
 
 	if result.Failed() {
 		receipt.SetStatus(types.ReceiptFailed)
@@ -387,11 +391,15 @@ func (t *Transition) Write(txn *types.Transaction) error {
 }
 
 // Commit commits the final result
-func (t *Transition) Commit() (Snapshot, types.Hash) {
-	objs := t.state.Commit(t.config.EIP155)
+func (t *Transition) Commit() (Snapshot, types.Hash, error) {
+	objs, err := t.state.Commit(t.config.EIP155)
+	if err != nil {
+		return nil, types.ZeroHash, err
+	}
+
 	s2, root := t.snap.Commit(objs)
 
-	return s2, types.BytesToHash(root)
+	return s2, types.BytesToHash(root), nil
 }
 
 func (t *Transition) subGasPool(amount uint64) error {
@@ -418,7 +426,9 @@ func (t *Transition) Apply(msg *types.Transaction) (*runtime.ExecutionResult, er
 
 	result, err := t.apply(msg)
 	if err != nil {
-		t.state.RevertToSnapshot(s)
+		if revertErr := t.state.RevertToSnapshot(s); revertErr != nil {
+			return nil, revertErr
+		}
 	}
 
 	if t.PostHook != nil {
@@ -673,25 +683,21 @@ func (t *Transition) Call2(
 }
 
 func (t *Transition) run(contract *runtime.Contract, host runtime.Host) *runtime.ExecutionResult {
-	// check contract deployment allow list (if any)
-	if t.deploymentAllowList != nil && t.deploymentAllowList.Addr() == contract.CodeAddress {
-		return t.deploymentAllowList.Run(contract, host, &t.config)
-	}
-
-	// check contract deployment block list (if any)
-	if t.deploymentBlockList != nil && t.deploymentBlockList.Addr() == contract.CodeAddress {
-		return t.deploymentBlockList.Run(contract, host, &t.config)
+	if result := t.handleAllowBlockListsUpdate(contract, host); result != nil {
+		return result
 	}
 
 	// check txns access lists, allow list takes precedence over block list
 	if t.txnAllowList != nil {
-		if t.txnAllowList.Addr() == contract.CodeAddress {
-			return t.txnAllowList.Run(contract, host, &t.config)
-		}
-
 		if contract.Caller != contracts.SystemCaller {
 			role := t.txnAllowList.GetRole(contract.Caller)
 			if !role.Enabled() {
+				t.logger.Debug(
+					"Failing transaction. Caller is not in the transaction allowlist",
+					"contract.Caller", contract.Caller,
+					"contract.Address", contract.Address,
+				)
+
 				return &runtime.ExecutionResult{
 					GasLeft: 0,
 					Err:     runtime.ErrNotAuth,
@@ -699,29 +705,21 @@ func (t *Transition) run(contract *runtime.Contract, host runtime.Host) *runtime
 			}
 		}
 	} else if t.txnBlockList != nil {
-		if t.txnBlockList.Addr() == contract.CodeAddress {
-			return t.txnBlockList.Run(contract, host, &t.config)
-		}
-
 		if contract.Caller != contracts.SystemCaller {
 			role := t.txnBlockList.GetRole(contract.Caller)
 			if role == addresslist.EnabledRole {
+				t.logger.Debug(
+					"Failing transaction. Caller is in the transaction blocklist",
+					"contract.Caller", contract.Caller,
+					"contract.Address", contract.Address,
+				)
+
 				return &runtime.ExecutionResult{
 					GasLeft: 0,
 					Err:     runtime.ErrNotAuth,
 				}
 			}
 		}
-	}
-
-	// check bridge allow list (if any)
-	if t.bridgeAllowList != nil && t.bridgeAllowList.Addr() == contract.CodeAddress {
-		return t.bridgeAllowList.Run(contract, host, &t.config)
-	}
-
-	// check contract deployment block list (if any)
-	if t.bridgeBlockList != nil && t.bridgeBlockList.Addr() == contract.CodeAddress {
-		return t.bridgeBlockList.Run(contract, host, &t.config)
 	}
 
 	// check the precompiles
@@ -787,7 +785,12 @@ func (t *Transition) applyCall(
 
 	result = t.run(c, host)
 	if result.Failed() {
-		t.state.RevertToSnapshot(snapshot)
+		if err := t.state.RevertToSnapshot(snapshot); err != nil {
+			return &runtime.ExecutionResult{
+				GasLeft: c.Gas,
+				Err:     err,
+			}
+		}
 	}
 
 	t.captureCallEnd(c, result)
@@ -795,21 +798,14 @@ func (t *Transition) applyCall(
 	return result
 }
 
-var emptyHash types.Hash
-
 func (t *Transition) hasCodeOrNonce(addr types.Address) bool {
-	nonce := t.state.GetNonce(addr)
-	if nonce != 0 {
+	if t.state.GetNonce(addr) != 0 {
 		return true
 	}
 
 	codeHash := t.state.GetCodeHash(addr)
 
-	if codeHash != emptyCodeHashTwo && codeHash != emptyHash {
-		return true
-	}
-
-	return false
+	return codeHash != types.EmptyCodeHash && codeHash != types.ZeroHash
 }
 
 func (t *Transition) applyCreate(c *runtime.Contract, host runtime.Host) *runtime.ExecutionResult {
@@ -825,7 +821,7 @@ func (t *Transition) applyCreate(c *runtime.Contract, host runtime.Host) *runtim
 	// Increment the nonce of the caller
 	t.state.IncrNonce(c.Caller)
 
-	// Check if there if there is a collision and the address already exists
+	// Check if there is a collision and the address already exists
 	if t.hasCodeOrNonce(c.Address) {
 		return &runtime.ExecutionResult{
 			GasLeft: 0,
@@ -864,6 +860,12 @@ func (t *Transition) applyCreate(c *runtime.Contract, host runtime.Host) *runtim
 		role := t.deploymentAllowList.GetRole(c.Caller)
 
 		if !role.Enabled() {
+			t.logger.Debug(
+				"Failing contract deployment. Caller is not in the deployment allowlist",
+				"contract.Caller", c.Caller,
+				"contract.Address", c.Address,
+			)
+
 			return &runtime.ExecutionResult{
 				GasLeft: 0,
 				Err:     runtime.ErrNotAuth,
@@ -873,6 +875,12 @@ func (t *Transition) applyCreate(c *runtime.Contract, host runtime.Host) *runtim
 		role := t.deploymentBlockList.GetRole(c.Caller)
 
 		if role == addresslist.EnabledRole {
+			t.logger.Debug(
+				"Failing contract deployment. Caller is in the deployment blocklist",
+				"contract.Caller", c.Caller,
+				"contract.Address", c.Address,
+			)
+
 			return &runtime.ExecutionResult{
 				GasLeft: 0,
 				Err:     runtime.ErrNotAuth,
@@ -882,14 +890,22 @@ func (t *Transition) applyCreate(c *runtime.Contract, host runtime.Host) *runtim
 
 	result = t.run(c, host)
 	if result.Failed() {
-		t.state.RevertToSnapshot(snapshot)
+		if err := t.state.RevertToSnapshot(snapshot); err != nil {
+			return &runtime.ExecutionResult{
+				Err: err,
+			}
+		}
 
 		return result
 	}
 
 	if t.config.EIP158 && len(result.ReturnValue) > SpuriousDragonMaxCodeSize {
 		// Contract size exceeds 'SpuriousDragon' size limit
-		t.state.RevertToSnapshot(snapshot)
+		if err := t.state.RevertToSnapshot(snapshot); err != nil {
+			return &runtime.ExecutionResult{
+				Err: err,
+			}
+		}
 
 		return &runtime.ExecutionResult{
 			GasLeft: 0,
@@ -905,7 +921,11 @@ func (t *Transition) applyCreate(c *runtime.Contract, host runtime.Host) *runtim
 
 		// Out of gas creating the contract
 		if t.config.Homestead {
-			t.state.RevertToSnapshot(snapshot)
+			if err := t.state.RevertToSnapshot(snapshot); err != nil {
+				return &runtime.ExecutionResult{
+					Err: err,
+				}
+			}
 
 			result.GasLeft = 0
 		}
@@ -918,6 +938,41 @@ func (t *Transition) applyCreate(c *runtime.Contract, host runtime.Host) *runtim
 	t.state.SetCode(c.Address, result.ReturnValue)
 
 	return result
+}
+
+func (t *Transition) handleAllowBlockListsUpdate(contract *runtime.Contract,
+	host runtime.Host) *runtime.ExecutionResult {
+	// check contract deployment allow list (if any)
+	if t.deploymentAllowList != nil && t.deploymentAllowList.Addr() == contract.CodeAddress {
+		return t.deploymentAllowList.Run(contract, host, &t.config)
+	}
+
+	// check contract deployment block list (if any)
+	if t.deploymentBlockList != nil && t.deploymentBlockList.Addr() == contract.CodeAddress {
+		return t.deploymentBlockList.Run(contract, host, &t.config)
+	}
+
+	// check bridge allow list (if any)
+	if t.bridgeAllowList != nil && t.bridgeAllowList.Addr() == contract.CodeAddress {
+		return t.bridgeAllowList.Run(contract, host, &t.config)
+	}
+
+	// check bridge block list (if any)
+	if t.bridgeBlockList != nil && t.bridgeBlockList.Addr() == contract.CodeAddress {
+		return t.bridgeBlockList.Run(contract, host, &t.config)
+	}
+
+	// check transaction allow list (if any)
+	if t.txnAllowList != nil && t.txnAllowList.Addr() == contract.CodeAddress {
+		return t.txnAllowList.Run(contract, host, &t.config)
+	}
+
+	// check transaction block list (if any)
+	if t.txnBlockList != nil && t.txnBlockList.Addr() == contract.CodeAddress {
+		return t.txnBlockList.Run(contract, host, &t.config)
+	}
+
+	return nil
 }
 
 func (t *Transition) SetState(addr types.Address, key types.Hash, value types.Hash) {

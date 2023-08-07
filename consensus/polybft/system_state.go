@@ -1,7 +1,6 @@
 package polybft
 
 import (
-	"encoding/json"
 	"fmt"
 	"math/big"
 
@@ -27,8 +26,6 @@ type SystemState interface {
 	GetEpoch() (uint64, error)
 	// GetNextCommittedIndex retrieves next committed bridge state sync index
 	GetNextCommittedIndex() (uint64, error)
-	// GetStakeOnValidatorSet retrieves stake of given validator on ValidatorSet contract
-	GetStakeOnValidatorSet(validatorAddr types.Address) (*big.Int, error)
 }
 
 var _ SystemState = &SystemStateImpl{}
@@ -55,21 +52,6 @@ func NewSystemState(valSetAddr types.Address, stateRcvAddr types.Address, provid
 	return s
 }
 
-// GetStakeOnValidatorSet retrieves stake of given validator on ValidatorSet contract
-func (s *SystemStateImpl) GetStakeOnValidatorSet(validatorAddr types.Address) (*big.Int, error) {
-	rawResult, err := s.validatorContract.Call("balanceOf", ethgo.Latest, validatorAddr)
-	if err != nil {
-		return nil, err
-	}
-
-	balance, isOk := rawResult["0"].(*big.Int)
-	if !isOk {
-		return nil, fmt.Errorf("failed to decode balance")
-	}
-
-	return balance, nil
-}
-
 // GetEpoch retrieves current epoch number from the smart contract
 func (s *SystemStateImpl) GetEpoch() (uint64, error) {
 	rawResult, err := s.validatorContract.Call("currentEpochId", ethgo.Latest)
@@ -78,7 +60,6 @@ func (s *SystemStateImpl) GetEpoch() (uint64, error) {
 	}
 
 	epochNumber, isOk := rawResult["0"].(*big.Int)
-
 	if !isOk {
 		return 0, fmt.Errorf("failed to decode epoch")
 	}
@@ -99,24 +80,4 @@ func (s *SystemStateImpl) GetNextCommittedIndex() (uint64, error) {
 	}
 
 	return nextCommittedIndex.Uint64() + 1, nil
-}
-
-func buildLogsFromReceipts(entry []*types.Receipt, header *types.Header) []*types.Log {
-	var logs []*types.Log
-
-	for _, taskReceipt := range entry {
-		for _, taskLog := range taskReceipt.Logs {
-			log := new(types.Log)
-			*log = *taskLog
-
-			data := map[string]interface{}{
-				"Hash":   header.Hash,
-				"Number": header.Number,
-			}
-			log.Data, _ = json.Marshal(&data)
-			logs = append(logs, log)
-		}
-	}
-
-	return logs
 }
